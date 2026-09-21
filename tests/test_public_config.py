@@ -53,8 +53,9 @@ class PublicSafety(unittest.TestCase):
 
     def test_ssh_uses_configured_alias_and_host_key_checks(self):
         result=Mock(returncode=0,stdout='{"schemaVersion":2}',stderr='')
-        with patch.object(ssh_bridge,'WINDOWS_ALIAS','workstation-alias'),patch.object(ssh_bridge.subprocess,'run',return_value=result) as run:
-            ssh_bridge.request('identity')
+        spec=dict(alias='workstation-alias',platform='windows',backend_alias='storage')
+        with patch.object(ssh_bridge,'controller_specs',return_value=[spec]),patch.object(ssh_bridge.subprocess,'run',return_value=result) as run:
+            ssh_bridge.request('identity',alias='workstation-alias')
         self.assertIn('workstation-alias',run.call_args.args[0])
         self.assertIn('StrictHostKeyChecking=yes',run.call_args.args[0])
         self.assertNotIn('Bypass',run.call_args.args[0][-1])
@@ -64,7 +65,7 @@ class PublicSafety(unittest.TestCase):
     def test_uncertain_close_is_not_replayed(self):
         with patch.object(ssh_bridge.subprocess,'run',side_effect=subprocess.TimeoutExpired('ssh',25)) as run:
             with self.assertRaises(ssh_bridge.BridgeError) as error:
-                ssh_bridge.request('close-desktop',expectedPid=1,expectedStart='2026-01-01T00:00:00Z')
+                ssh_bridge.request('close-desktop',expectedPid=1,expectedStart='2026-01-01T00:00:00Z',expectedHostName='workstation')
         self.assertEqual(error.exception.code,'REMOTE_EFFECT_UNKNOWN')
         self.assertEqual(run.call_count,1)
 

@@ -12,10 +12,10 @@ IDs and process identifiers even though conversation text and credentials are
 excluded. Review/redact them before sharing. Never attach authentication files,
 SSH keys, task databases, or full session histories to an issue.
 
-This repository is private. Authorized collaborators may use a private repository
-issue for a sanitized report visible to those collaborators. No public reporting
-email is advertised. Establish a private security-reporting route before making
-the repository public; do not attach credentials or sensitive histories.
+Do not post credentials or sensitive histories in issues. Use GitHub's private
+vulnerability reporting when available. If no confidential reporting route is
+listed, open an issue requesting contact instructions without disclosing details.
+No reporting email is advertised by this project.
 
 The application authenticates through existing local/SSH access; it is not a
 security boundary against another process with the same OS user privileges.

@@ -41,6 +41,14 @@ class RepositoryContract(unittest.TestCase):
         workflow = (ROOT / '.github/workflows/check.yml').read_text()
         self.assertRegex(workflow, r'(?m)^on: \[workflow_dispatch\]$')
 
+    def test_user_documents_are_visibility_independent(self):
+        phrases=('private 开发预览版','此私有仓库','This repository is private',
+                 'Current visibility: **private**','two-computer version','原个人工具')
+        documents=list(ROOT.glob('*.md'))+list((ROOT/'docs').glob('*.md'))
+        for document in documents:
+            for phrase in phrases:
+                self.assertNotIn(phrase,document.read_text(),document.name)
+
 
 if __name__ == '__main__':
     unittest.main()

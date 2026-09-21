@@ -38,5 +38,41 @@ if not isinstance(EXCLUDED_IDS,list) or any(not isinstance(value,str) or not re.
     raise ValueError('excluded_thread_ids must contain UUIDs')
 
 
-def is_windows_peer(peer):
-    return bool(set(peer.get('aliases',[])).intersection(PEER_ALIASES))
+def controller_specs(config=None):
+    """Explicit SSH controllers; multiple aliases may denote one physical host."""
+    config = CONFIG if config is None else config
+    entries = config.get('ssh_controllers')
+    if entries is None:
+        alias = config.get('windows_ssh_alias', 'windows-pc')
+        entries = [dict(alias=alias, platform='windows',
+                        peer_aliases=config.get('windows_peer_aliases', [alias]),
+                        backend_alias=config.get('mac_ssh_alias', 'mac'))]
+    if not isinstance(entries, list) or len(entries)>32:
+        raise ValueError('ssh_controllers must contain at most 32 explicit hosts')
+    result = []
+    claimed = set()
+    for value in entries:
+        if not isinstance(value, dict):
+            raise ValueError('each SSH controller must be an object')
+        alias = value.get('alias')
+        aliases = value.get('peer_aliases', [alias])
+        backend = value.get('backend_alias', config.get('mac_ssh_alias', 'mac'))
+        platform = value.get('platform')
+        if (not isinstance(aliases, list) or not aliases or alias not in aliases or
+                any(not isinstance(a,str) or not ALIAS_PATTERN.fullmatch(a) for a in [alias,backend,*aliases]) or
+                platform not in ('windows','mac')):
+            raise ValueError('SSH controllers need explicit aliases and a windows/mac platform')
+        if claimed.intersection(aliases):
+            raise ValueError('an SSH alias cannot belong to multiple controllers')
+        claimed.update(aliases)
+        result.append(dict(id='ssh:'+alias, alias=alias, platform=platform,
+                           peer_aliases=sorted(set(aliases)), backend_alias=backend))
+    return result
+
+
+def peer_controller_ids(peer, specs=None):
+    specs = controller_specs() if specs is None else specs
+    return [spec['id'] for spec in specs if set(peer.get('aliases',[])).intersection(spec['peer_aliases'])]
+
+
+controller_specs()  # Reject ambiguous configuration before any connection.

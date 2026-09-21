@@ -1,38 +1,48 @@
-# Verification status — private development preview
+# Verification status
 
-The independent candidate has not been installed over the personal tool. Its
-source repository is private; no public release or installer asset is published.
+These checks describe the current source, not a guarantee of safe operation in
+every environment. Handoff remains disabled by default.
 
-Verified during preparation:
+## Verified with isolated fixtures
 
-- 94 Python fixture/unit checks in an isolated Linux VM, including configuration
-  isolation, opt-in mutation guards, SSH argument construction, no replay after
-  uncertain close, socket symlinks, writer scope and continuation receipts.
-- SSH-only discovery regressions: registration without Codex account state,
-  add/remove on refresh, no cloud/auth/cache file reads, no HTTP discovery path,
-  no re-enabling account discovery via old config, no unregistered-host probes,
-  rejection of obsolete cloud target IDs, and both clients' schema-4 guards.
-  Configuration alone never grants takeover eligibility.
-- Repository checks: required user-facing documents and relative links, separate
-  Windows log storage, strict host-key checking in Windows requests, and no
-  automatic hosted CI trigger during private preparation.
-- PowerShell source parsing and 9 pure Windows controller fixtures, also in the VM.
-- Source-release guard on the selected text files.
-- Native macOS application compilation and ad-hoc signature verification,
-  refreshed after the SSH-only changes. This is a build-only check, not native
-  GUI or real handoff acceptance.
+- 119 Python unit/fixture checks in an isolated Linux VM.
+- Multiple Windows/macOS controller identities sharing one backend; distinct
+  hosts with the same PID; ambiguous alias/address rejection; full source-host
+  impact lists; preserving the selected controller and shared server.
+- Handoff selection for already-owned and unowned tasks, destination-side
+  controller cleanup, and rejecting a shared destination as an exclusive success.
+- Windows standalone packaging: only allowlisted code/config fields travel;
+  a fake backend runs without prior installation and its temporary files are
+  removed after normal exit. No real Codex task was used for this test.
+- Interruption receipts, no duplicate continuation for unchanged tasks,
+  unknown-delivery guards, source PID/start and lock-scope checks.
+- SSH-only discovery: no account-device API, token lookup, cloud cache, unknown
+  host probing or revival of old account-discovery settings.
+- PowerShell parsing, 9 Windows controller fixtures, and 4 standalone-package
+  checks; these make no live SSH or GUI calls.
+- Required user documentation, local Markdown links, isolated log paths and
+  strict host-key options.
+- Source-release checks excluding real configuration, credentials, task
+  databases, runtime logs and compiled artifacts from the source tree.
 
-Not verified:
+## Native build
 
-- The new portable SSH adapter has not been used to interrupt a real task.
-- A fresh installation on someone else's Mac/Windows pair has not been exercised.
-- Native UI behavior and child-agent continuation in the public candidate have
-  not been tested end-to-end.
-- GitHub Actions is manual-only and has not run on GitHub. Private-repository
-  pushes do not automatically consume hosted-runner time.
-- Automated release checks are not a comprehensive security audit or a legal
-  determination of rights. Making the repository public or releasing binaries
-  still requires a separate maintainer decision and review.
+The schema-5 macOS application compiles and passes ad-hoc signature verification.
+The build writes only to the independent project build directory. Compilation
+and signature checks are not native GUI or real handoff acceptance.
 
-The personal precursor's operational results must not be presented as proof for
-this refactored release. Validate on disposable, authorized sessions first.
+## Not verified end-to-end
+
+- A real multi-controller Windows/macOS deployment and fresh-user installation.
+- Windows PowerShell 5.1 through a real SSH connection into the temporary backend;
+  PowerShell package tests ran in an isolated PowerShell runtime.
+- Remote macOS desktop closure on a live user's application.
+- Complete GUI workflows, real task interruption, or every child-agent recovery.
+- Sudden network loss or process termination in every stage. Abrupt termination
+  can leave temporary code directories or incomplete receipts.
+- GitHub Actions execution. Hosted CI is manual-only.
+
+The data backend currently supports macOS; multiple-controller support is not
+a claim of arbitrary-OS storage support or synchronization of independent task
+databases. Revalidate on disposable, authorized tasks before relying on a new
+Codex release. Automated checks are not a comprehensive security or legal audit.

@@ -54,13 +54,13 @@ class WriterInvariants(unittest.TestCase):
         self.rpc.call.side_effect = self.rpc_call
         for name, value in [('process_table', self.processes), ('lock_inventory', self.locks),
                             ('metadata', self.threads), ('socket_server', 100),
-                            ('windows_identity', self.identity), ('read_json', {})]:
+                            ('controller_identity', self.identity), ('read_json', {})]:
             self.stack.enter_context(patch.object(writer, name, return_value=value))
         self.stack.enter_context(patch.object(writer, 'RPC', return_value=self.rpc))
         self.discover_mock = self.stack.enter_context(
             patch.object(writer, 'discover', side_effect=self.discover_result))
         # Unexpected operations fail immediately; no real subprocess/network/write fallback.
-        for name in ('command', 'windows_bridge', 'atomic_json'):
+        for name in ('command', 'controller_bridge', 'atomic_json'):
             self.stack.enter_context(patch.object(writer, name, side_effect=AssertionError(name + ' forbidden')))
         self.kill = self.stack.enter_context(patch.object(writer.os, 'kill', side_effect=AssertionError('kill forbidden')))
 

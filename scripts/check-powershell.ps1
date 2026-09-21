@@ -7,4 +7,5 @@ foreach ($file in @(Get-ChildItem (Join-Path $root 'app') -Filter '*.ps1')+@(Get
     if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
 }
 & (Join-Path $root 'tests/test_windows_controller.ps1') -ControllerPath (Join-Path $root 'app/windows_controller.ps1')
+& (Join-Path $root 'tests/test_windows_package.ps1') -ProjectRoot $root
 Write-Output 'PowerShell parse and pure controller fixtures: PASS'

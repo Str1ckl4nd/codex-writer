@@ -7,6 +7,7 @@ $configDir=Join-Path $env:USERPROFILE '.config\session-writer'
 [void][IO.Directory]::CreateDirectory($configDir)
 Copy-Item -LiteralPath (Join-Path $projectDir 'app\unlock.ps1') -Destination $installDir
 Copy-Item -LiteralPath (Join-Path $projectDir 'app\windows_controller.ps1') -Destination $installDir
+Get-ChildItem -LiteralPath (Join-Path $projectDir 'app') -Filter '*.py' | Copy-Item -Destination $installDir
 $config=Join-Path $configDir 'config.json'
 if (-not (Test-Path -LiteralPath $config)) { Copy-Item -LiteralPath (Join-Path $projectDir 'config.example.json') -Destination $config }
 $shortcutPath=Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Session Writer.lnk'

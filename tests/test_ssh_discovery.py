@@ -124,8 +124,8 @@ Match exec "unexpected-command"
         app = Path(discovery.__file__).parent
         swift = (app / 'session_writer_ui.swift').read_text()
         windows = (app / 'unlock.ps1').read_text()
-        self.assertIn('snapshot.schemaVersion == 4', swift)
-        self.assertIn('$NewSnapshot.schemaVersion -ne 4', windows)
+        self.assertIn('snapshot.schemaVersion == 5', swift)
+        self.assertIn('$NewSnapshot.schemaVersion -ne 5', windows)
         for source in (swift, windows):
             self.assertIn('刷新 SSH 主机', source)
             self.assertNotIn('账号已连接机器', source)

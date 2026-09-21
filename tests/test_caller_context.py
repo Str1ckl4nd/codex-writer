@@ -98,14 +98,14 @@ class HostRoleIntegration(unittest.TestCase):
 
     def test_unregistered_host_is_not_queried_even_when_a_peer_is_observed(self):
         self.hosts={}
-        with patch.object(writer,'windows_identity',side_effect=AssertionError('unregistered probe')):
+        with patch.object(writer,'controller_identity',side_effect=AssertionError('unregistered probe')):
             snapshot,_=writer.observe(client_context={'platform':'mac'})
         self.assertEqual([m['id'] for m in snapshot['machines']],['local'])
         self.assertIsNone(next(r for r in snapshot['records'] if r['id']==MAIN)['ownerMachineId'])
 
     def test_absent_ssh_peer_cannot_reuse_cached_identity_as_online(self):
         self.peers=[]
-        with patch.object(writer,'windows_identity',side_effect=AssertionError('no connected peer')):
+        with patch.object(writer,'controller_identity',side_effect=AssertionError('no connected peer')):
             snapshot,_=writer.observe(client_context={'platform':'mac'})
         target=next(m for m in snapshot['machines'] if m['id']==WINDOWS)
         self.assertFalse(target['selectable'])
@@ -123,7 +123,7 @@ class HostRoleIntegration(unittest.TestCase):
         self.hosts=HOSTS
         with patch.dict(os.environ,{'SSH_CONNECTION':'192.0.2.1 55 192.0.2.2 22'}), \
              patch('caller_context.time.time',return_value=1001), \
-             patch.object(writer,'windows_identity',side_effect=AssertionError('must not SSH back to caller')), \
+             patch.object(writer,'controller_identity',side_effect=AssertionError('must not SSH back to caller')), \
              patch.object(writer,'atomic_json'):
             snapshot,_=writer.observe(client_context=value)
         self.assertEqual(snapshot['caller']['hostName'],NAME)
@@ -133,7 +133,7 @@ class HostRoleIntegration(unittest.TestCase):
         self.assertNotIn('本机',mac['statusLabel'])
         target=next(m for m in snapshot['machines'] if m['id']==WINDOWS)
         self.assertTrue(target['selectable'])
-        self.assertIn('本机 Windows',target['statusLabel'])
+        self.assertIn('当前操作端',target['statusLabel'])
         task=next(r for r in snapshot['records'] if r['id']==MAIN)
         self.assertEqual(task['writerHostName'],'mac-pc.local')
         self.kill.assert_not_called()

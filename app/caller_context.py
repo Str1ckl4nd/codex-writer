@@ -1,7 +1,7 @@
 """Separate the operating computer from the Mac that stores the task files.
 
-Windows' locally gathered controller metadata is usable only over the configured
-PC's authenticated SSH connection. No account or cloud device identity is used.
+Locally gathered controller metadata is usable only over a uniquely configured
+host's authenticated SSH connection. No account or cloud device identity is used.
 """
 import argparse
 import base64
@@ -10,7 +10,7 @@ import ipaddress
 import json
 import re
 import time
-from runtime_config import PEER_ALIASES
+from runtime_config import controller_specs
 
 
 def decode_context(encoded):
@@ -36,7 +36,7 @@ def decode_context(encoded):
                 for row in rows:
                     if (not isinstance(row,dict) or type(row.get('pid')) is not int or row['pid']<1
                             or not isinstance(row.get('start'),str) or not re.fullmatch(r'\d{4}-[0-9T:.Z+-]{1,76}',row['start'])
-                            or row.get('name') not in ('ChatGPT.exe','Codex.exe')):
+                            or row.get('name') not in ('ChatGPT.exe','Codex.exe','ChatGPT','Codex')):
                         raise ValueError()
                     if field=='controllers' and (not isinstance(row.get('proxyPids'),list) or len(row['proxyPids'])>64
                             or any(type(pid) is not int or pid<1 for pid in row['proxyPids'])):
@@ -63,15 +63,17 @@ def ip(value):
         return None
 
 
-def resolve_context(value, ssh_connection, hosts, local_name, now=None):
+def resolve_context(value, ssh_connection, hosts, local_name, now=None, specs=None):
     fields=ssh_connection.split()
     peer=ip(fields[0]) if fields else None
-    allowed={ip(endpoint) for alias in PEER_ALIASES
-             for endpoint in hosts.get(alias,{}).get('endpoints',[])}-{None}
-    if value and value['platform']=='windows':
-        fresh=abs((time.time() if now is None else now)-value['observedAt'])<=90
-        verified=peer in allowed and fresh
-        caller=dict(platform='windows',hostName=value['hostName'],verified=verified,machineId=None,
+    specs=controller_specs() if specs is None else specs
+    matching=[spec for spec in specs if peer is not None and any(
+        ip(endpoint)==peer for alias in spec['peer_aliases'] for endpoint in hosts.get(alias,{}).get('endpoints',[]))]
+    if value and (value['platform']=='windows' or fields):
+        fresh=abs((time.time() if now is None else now)-value.get('observedAt',0))<=90
+        verified=len(matching)==1 and matching[0]['platform']==value['platform'] and fresh
+        caller=dict(platform=value['platform'],hostName=value.get('hostName','未确认'),verified=verified,
+                    machineId=matching[0]['id'] if verified else None,
                     evidence='local-ui-over-known-ssh' if verified else 'unverified-client')
         identity=None
         if verified:
@@ -79,10 +81,10 @@ def resolve_context(value, ssh_connection, hosts, local_name, now=None):
             if identity is None:
                 identity=dict(schemaVersion=2,hostName=value['hostName'],available=False,apps=[],controllers=[],
                               proxyCount=0,errorCode='LOCAL_IDENTITY_UNAVAILABLE',
-                              error='Windows 本机在线，但未读到本机 Codex 进程状态。')
+                              error='操作端在线，但未读到本机 Codex 进程状态。')
             else:
                 identity.update(available=True,checkedAt=time.time(),evidence='windows-local')
         return caller,identity
-    if value and value['platform']=='mac' or not fields:
+    if not fields:
         return dict(platform='mac',hostName=local_name,verified=True,machineId='local',evidence='local-ui'),None
     return dict(platform='remote',hostName='未标识的远端操作端',verified=False,machineId=None,evidence='ssh'),None

@@ -50,10 +50,11 @@ function Get-WriterIdentity {
 }
 
 function Invoke-WriterIdentityOperation {
-    param([Parameter(Mandatory=$true)][ValidateSet('identity','close-desktop')][string]$Action,[int]$PidToStop,[string]$StartToMatch,[string]$MacAlias='mac')
+    param([Parameter(Mandatory=$true)][ValidateSet('identity','close-desktop')][string]$Action,[int]$PidToStop,[string]$StartToMatch,[string]$MacAlias='mac',[string]$HostNameToMatch='')
     $processes=@(Get-CimInstance Win32_Process)
     $identity=Get-WriterIdentity -Processes $processes -MacAlias $MacAlias
     if($Action -eq 'identity'){$identity|ConvertTo-Json -Depth 6 -Compress;return}
+    if($HostNameToMatch -and $identity.hostName -cne $HostNameToMatch){throw 'CONTROLLER_CHANGED'}
     $owners=@($identity.controllers)
     if($identity.detection -ne 'confirmed' -or $owners.Count -ne 1 -or $owners[0].pid -ne $PidToStop -or $owners[0].start -cne $StartToMatch){throw 'CONTROLLER_CHANGED'}
     Stop-Process -Id $PidToStop -Force

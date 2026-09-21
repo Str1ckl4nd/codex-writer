@@ -183,7 +183,7 @@ class ForcedWorkflow(unittest.TestCase):
             lock_inventory=lambda: copy.deepcopy(self.locks),
             process_kind=lambda process, all_processes: 'ssh-server',
             os=types.SimpleNamespace(kill=self.kill), atomic_json=self.save, read_json=self.read,
-            event=Mock(), windows_bridge=Mock(side_effect=AssertionError('no Windows close for orphan')),
+            event=Mock(), close_remote_controllers=Mock(return_value=[]),checked_peers=Mock(return_value=[]),
             wait_released=self.wait_released, acquire_writer=self.acquire)
         self.reader = Mock()
         self.reader.latest.side_effect = lambda key: dict(turnId=TURN if key == ROOT else CHILD_TURN, turnStatus='interrupted')
@@ -296,6 +296,17 @@ class ForcedWorkflow(unittest.TestCase):
         text = (self.w.ROOT/'logs/force-handoff.json').read_text()
         self.assertNotIn('collaboration.followup_task', text)
         self.assertNotIn('继续', text)
+
+    def test_preserved_shared_server_does_not_restart_still_running_agents(self):
+        self.machine=dict(id='ssh:selected',name='selected',clientKind='windows')
+        self.plan['forceScope']['preservedPids']=[100]
+        self.w.acquire_writer=Mock(return_value=dict(ok=True,changed=False,pid=100,threadId=ROOT,machineId='ssh:selected',message='verified'))
+        self.reader.latest.side_effect=lambda key: dict(turnId=TURN if key==ROOT else CHILD_TURN,turnStatus='inProgress')
+        result=force.apply(self.w,self.plan,self.context,self.machine)
+        self.assertEqual(self.killed,[])
+        self.assertEqual(result['continuationRequested'],0)
+        self.assertTrue(result['continuationComplete'])
+        self.desktop.start.assert_not_called()
 
 
 if __name__ == '__main__':

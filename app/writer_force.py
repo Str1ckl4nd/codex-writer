@@ -13,7 +13,7 @@ import uuid
 from writer_desktop import Desktop
 from writer_history import HistoryReader
 from writer_rpc import RPC
-from runtime_config import is_windows_peer
+from runtime_config import peer_controller_ids
 
 
 AGENT_PATH = re.compile(r'^/root(?:/[A-Za-z0-9_-]+)*$')
@@ -64,6 +64,13 @@ def scope_for(thread_id, machine, context):
             source_pids.add(owner['pid'])
         elif owner.get('ownerState') in ('unknown', 'ambiguous') and not owner.get('pid'):
             raise ValueError('主任务或子代理存在多个写入者')
+    if machine['id']!='local' and context.get('serverPid') and any(
+            peer['serverPid']==context['serverPid'] and
+            peer_controller_ids(peer,context.get('controllerSpecs',[]))!=[machine['id']]
+            for peer in context.get('peers',[])):
+        # Even an unowned/local-desktop task may need other destination-side
+        # controllers detached before this target becomes the unique writer.
+        source_pids.add(context['serverPid'])
     affected = sorted({key for pid in source_pids for key in context['affected'].get(pid, [])})
     roots = {key: root_of(key, context['threads']) for key in affected}
     # Historical, unloaded descendants are not interruption candidates or UI data.
@@ -125,12 +132,10 @@ def prepare(w, thread_id, machine, context):
         kind = w.process_kind(context['processes'].get(pid, {}), context['processes'])
         if kind not in ('ssh-server', 'mac-desktop'):
             raise w.WriterError('强制接管也不能停止身份未知的进程。', code='FORCE_PROCESS_UNKNOWN')
-        peers = [peer for peer in context['peers'] if peer['serverPid'] == pid]
-        if kind == 'ssh-server' and peers:
-            if len({peer['peerIp'] for peer in peers}) != 1 or not all(is_windows_peer(peer) for peer in peers):
-                raise w.WriterError('原服务存在未确认的控制端，不能强制停止。', code='FORCE_PEER_UNKNOWN')
-            if w.controller_problem(context['identity']):
-                raise w.WriterError(w.controller_problem(context['identity']), code='FORCE_CONTROLLER_UNKNOWN')
+        if kind == 'ssh-server':
+            w.controller_sources(pid,context)
+    scope['controllerImpacts']=[item for pid in scope['sourcePids'] for item in w.controller_impacts(pid,machine,context)]
+    scope['preservedPids']=[pid for pid in scope['sourcePids'] if machine['id']!='local' and pid==context['serverPid']]
     scope['runtime'] = runtime_records(w, scope, context) if scope['sourcePids'] else []
     return scope
 
@@ -210,6 +215,12 @@ def apply(w, plan, context, machine):
     save()
     terminated = set()
     released = set()
+    preserved = set(scope.get('preservedPids',[]))
+    receipt['closedControllerIds']=[]
+    receipt['preservedPids']=sorted(preserved)
+    def closed_controller(key):
+        receipt['closedControllerIds'].append(key)
+        save()
     deadline = time.monotonic()+150
 
     def check_time():
@@ -234,10 +245,11 @@ def apply(w, plan, context, machine):
                     raise w.WriterError('原 Mac 桌面进程已变化。', code='FORCE_PROCESS_CHANGED')
                 w.os.kill(app['pid'], signal.SIGTERM)
             else:
-                peers = [peer for peer in context['peers'] if peer['serverPid'] == pid]
-                if peers:
-                    controller = context['identity']['controllers'][0]
-                    w.windows_bridge('close-desktop', expectedPid=controller['pid'], expectedStart=controller['start'])
+                w.close_remote_controllers(pid,machine,context,on_closed=closed_controller)
+                if pid in preserved:
+                    continue
+                if w.checked_peers(pid,context):
+                    raise w.WriterError('仍有 SSH 控制端连接，未停止共享后台。',code='CONTROLLER_STILL_CONNECTED')
                 processes, _ = assert_scope(w, scope, context, allow_shrink=True)
                 if pid in processes:
                     w.os.kill(pid, signal.SIGTERM)
@@ -280,6 +292,10 @@ def apply(w, plan, context, machine):
                     continue
                 check_time()
                 last = reader.latest(entry['id'])
+                if (entry['pid'] in preserved and last.get('turnId')==entry['turnId'] and
+                        last.get('turnStatus')=='inProgress'):
+                    w.event('continue.skipped',operationId=operation_id,sessionId=entry['id'],status='live_writer_preserved')
+                    continue
                 if should_continue(entry, last, entry['pid'] in terminated):
                     eligible.append(entry)
                 else:
@@ -304,7 +320,7 @@ def apply(w, plan, context, machine):
                 prompt = recovery_prompt(root_id, entries, operation_id)
                 delivery['status'] = 'dispatching'
                 save()  # Write-ahead before anything that might start generation.
-                if machine['clientKind'] == 'windows':
+                if machine['id'] != 'local':
                     rpc = RPC(w.CONTROL, timeout=15)
                     try:
                         accepted = rpc.call('turn/start', dict(threadId=root_id,

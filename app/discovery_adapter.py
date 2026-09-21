@@ -192,7 +192,7 @@ def discover(force: bool = False) -> dict:
         machines.append(dict(id="ssh:" + alias, name=alias, status="connected" if linked else "configured",
                              statusLabel="SSH 代理已连接" if linked else "SSH 已配置，未核验",
                              source="ssh-config", selectable=False, clientKind="ssh", transport="ssh", alias=alias,
-                             reason="已登记 SSH 主机；仅配置的 Windows 控制端经连接和进程核验后可接管。",
+                             reason="已登记 SSH 主机；在 ssh_controllers 中声明控制端平台，经连接和进程核验后可接管。",
                              endpoints=host.get("endpoints", [])))
     return dict(machines=machines, diagnostics=diagnostics, peerConnections=peers, sshHosts=ssh_hosts,
                 discoveryMode="ssh-only", discoveredAt=int(time.time()), refreshAfterSeconds=REFRESH_SECONDS,

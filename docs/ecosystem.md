@@ -31,6 +31,6 @@ handoff/takeover mechanism. It is a community report, not a confirmed statement
 about which release first introduced the behavior.
 
 Do not market Session Writer as the first Codex handoff or session-sync tool.
-Its intended focus is a small, explicit two-computer ownership/diagnostic panel.
+Its intended focus is a standalone, explicit SSH-controller ownership/diagnostic panel.
 Reliability, compatibility and clear interruption receipts matter more than a
 novelty claim; there is no comparative reliability evidence yet.

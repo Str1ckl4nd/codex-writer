@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
 import fcntl
 import hashlib
@@ -22,7 +23,7 @@ from caller_context import decode_context, resolve_context
 from writer_rpc import RPC, RPCError
 from writer_log import event, log_info, recent_events
 import writer_force
-from runtime_config import APP_DIR, STATE_DIR, CODEX_HOME, CODEX_APP, CODEX_BINARY, EXCLUDED_IDS, WINDOWS_ALIAS, PEER_ALIASES, CONFIG, is_windows_peer
+from runtime_config import APP_DIR, STATE_DIR, CODEX_HOME, CODEX_APP, CODEX_BINARY, EXCLUDED_IDS, CONFIG, controller_specs, peer_controller_ids
 from ssh_bridge import request as ssh_request, BridgeError
 
 ROOT = STATE_DIR
@@ -134,43 +135,42 @@ def metadata():
     return {r['id']: dict(r) for r in rows}
 
 
-def windows_bridge(operation, **kwargs):
+def controller_bridge(operation, spec, **kwargs):
     started=time.monotonic()
-    event('bridge.start',operation=operation,stage='ssh',profile=WINDOWS_ALIAS)
+    event('bridge.start',operation=operation,stage='ssh',profile=spec['alias'])
     try:
-        value=ssh_request(operation,**kwargs)
+        value=ssh_request(operation,alias=spec['alias'],**kwargs)
     except BridgeError as error:
         event('bridge.failed',operation=operation,stage='ssh',errorCode=error.code,durationMs=(time.monotonic()-started)*1000)
-        raise WriterError('Windows 连接请求未确认：'+error.code,code=error.code,stage='ssh') from None
+        raise WriterError(spec['alias']+' 的 SSH 请求未确认：'+error.code,code=error.code,stage='ssh') from None
     if value.get('error'):
-        raise WriterError('Windows 连接检查失败。')
+        raise WriterError(spec['alias']+' 的连接检查失败。')
     event('bridge.complete',operation=operation,stage='remote_query',durationMs=(time.monotonic()-started)*1000,
           appCount=len(value.get('apps',[])),controllerCount=len(value.get('controllers',[])),proxyCount=value.get('proxyCount',0))
     return value
 
 
-def windows_identity(force=False):
-    path = ROOT/'windows-identity-cache.json'
-    previous = read_json(path)
-    ttl=45 if previous.get('available') and previous.get('detection')=='confirmed' else 3
-    if not force and previous.get('schemaVersion')==2 and 0 <= time.time()-previous.get('checkedAt', 0) < ttl:
-        event('identity.cache',cacheState='hit',status='ok' if previous.get('available') else 'failed')
+def controller_identity(spec, ssh_hosts, force=False):
+    binding=dict(spec=spec,hosts={a:ssh_hosts.get(a) for a in spec['peer_aliases']})
+    key=hashlib.sha256(json.dumps(binding,sort_keys=True).encode()).hexdigest()
+    path=ROOT/('controller-'+key[:24]+'-cache.json')
+    previous=read_json(path)
+    ttl=10 if previous.get('available') and previous.get('detection')=='confirmed' else 3
+    if (not force and previous.get('binding')==key and previous.get('schemaVersion')==2 and
+            0<=time.time()-previous.get('checkedAt',0)<ttl):
         return previous
-    event('identity.cache',cacheState='refresh')
     try:
-        identity = windows_bridge('identity')
-        if identity.get('schemaVersion')!=2 or not isinstance(identity.get('hostName'), str) or not isinstance(identity.get('controllers'), list):
-            raise WriterError('Windows 身份响应格式不匹配。')
-        identity.update(checkedAt=time.time(), available=True)
-        event('identity.complete',status=identity.get('detection','unknown'),appCount=len(identity.get('apps',[])),
-              controllerCount=len(identity['controllers']),proxyCount=identity.get('proxyCount',0))
+        identity=controller_bridge('identity',spec)
+        if (identity.get('schemaVersion')!=2 or not isinstance(identity.get('hostName'),str) or
+                not identity.get('hostName') or not isinstance(identity.get('controllers'),list)):
+            raise WriterError('SSH 身份响应格式不匹配。')
+        identity.update(checkedAt=time.time(),available=True,binding=key)
     except Exception as error:
-        identity = {'schemaVersion':2,'hostName': previous.get('hostName', ''), 'checkedAt': time.time(),
-                    'available': False, 'apps': [], 'controllers':[], 'proxyCount': 0,
-                    'error':str(error) if isinstance(error,WriterError) else type(error).__name__,
-                    'errorCode':getattr(error,'code',type(error).__name__), 'errorStage':getattr(error,'stage','identity')}
-        event('identity.failed',errorCode=identity['errorCode'],stage=identity['errorStage'],errorType=type(error).__name__)
-    atomic_json(path, identity)
+        identity=dict(schemaVersion=2,hostName=previous.get('hostName',''),checkedAt=time.time(),binding=key,
+                      available=False,apps=[],controllers=[],proxyCount=0,
+                      error=str(error) if isinstance(error,WriterError) else type(error).__name__,
+                      errorCode=getattr(error,'code',type(error).__name__))
+    atomic_json(path,identity)
     return identity
 
 
@@ -197,8 +197,77 @@ def controller_problem(identity):
     if len(owners)>1:
         return f'检测到 {len(owners)} 个桌面客户端连接此 Mac，无法确定应关闭哪一个。'
     if not identity.get('apps'):
-        return 'Windows 桌面客户端未运行。'
-    return 'Windows 桌面客户端正在运行，但尚未找到它通往此 Mac 的会话连接；请等待重连后刷新。'
+        return '远端桌面客户端未运行。'
+    return '远端桌面客户端正在运行，但尚未找到它通往此数据主机的 SSH 会话连接；请等待重连后刷新。'
+
+
+def controller_sources(pid, context):
+    specs=context.get('controllerSpecs',[])
+    by_id={spec['id']:spec for spec in specs}
+    ids=set()
+    for peer in context.get('peers',[]):
+        if peer['serverPid']!=pid:
+            continue
+        matches=peer_controller_ids(peer,specs)
+        if len(matches)!=1:
+            raise WriterError('原服务存在未唯一确认的 SSH 控制端，不能关闭。',code='CONTROLLER_UNKNOWN')
+        ids.add(matches[0])
+    result=[]
+    for key in sorted(ids):
+        identity=context.get('identities',{}).get(key,{})
+        problem=controller_problem(identity)
+        if problem or not identity.get('hostName'):
+            raise WriterError(by_id[key]['alias']+'：'+(problem or '主机名称未确认'),code='CONTROLLER_UNKNOWN')
+        result.append(dict(spec=by_id[key],identity=identity))
+    return result
+
+
+def controller_impacts(pid, machine, context):
+    keep=machine['id'] if machine['id']!='local' and pid==context['serverPid'] else None
+    return [dict(machineId=value['spec']['id'],name=value['identity']['hostName'],
+                 pid=value['identity']['controllers'][0]['pid'],start=value['identity']['controllers'][0]['start'])
+            for value in controller_sources(pid,context) if value['spec']['id']!=keep]
+
+
+def checked_peers(pid, context):
+    from discovery_adapter import peer_connections
+    def stamp(peer):
+        return json.dumps({k:v for k,v in peer.items() if k!='verifiedAt'},sort_keys=True)
+    approved={stamp(peer) for peer in context['peers'] if peer['serverPid']==pid}
+    current=[peer for peer in peer_connections() if peer['serverPid']==pid]
+    if not {stamp(peer) for peer in current}<=approved:
+        raise WriterError('SSH 控制端连接已经变化，请重新确认。',code='PEER_SCOPE_CHANGED')
+    return current
+
+
+def close_remote_controllers(pid, machine, context, on_closed=None):
+    keep=machine['id'] if machine['id']!='local' and pid==context['serverPid'] else None
+    closed=[]
+    for value in controller_sources(pid,context):
+        spec,identity=value['spec'],value['identity']
+        if spec['id']==keep:
+            continue
+        writer_force.assert_scope(sys.modules[__name__],
+            dict(sourcePids=[pid],affected=context['affected'].get(pid,[])),context,allow_shrink=True)
+        current=checked_peers(pid,context)
+        if not any(spec['id'] in peer_controller_ids(peer,context['controllerSpecs']) for peer in current):
+            continue
+        owner=identity['controllers'][0]
+        event('claim.close_controller',operation='claim',profile=spec['alias'],ownerPid=owner['pid'])
+        controller_bridge('close-desktop',spec,expectedPid=owner['pid'],expectedStart=owner['start'],
+                          expectedHostName=identity['hostName'])
+        deadline=time.monotonic()+12
+        while True:
+            current=checked_peers(pid,context)
+            if not any(spec['id'] in peer_controller_ids(peer,context['controllerSpecs']) for peer in current):
+                break
+            if time.monotonic()>deadline:
+                raise WriterError(spec['alias']+' 的 SSH 控制连接仍未释放。',code='CONTROLLER_STILL_CONNECTED')
+            time.sleep(.2)
+        closed.append(spec['id'])
+        if on_closed:
+            on_closed(spec['id'])
+    return closed
 
 
 def observe(force=False, client_context=None):
@@ -239,81 +308,89 @@ def observe(force=False, client_context=None):
         if rpc:
             rpc.close()
     diagnostics += discovery.get('diagnostics', [])
-    ssh_hosts = discovery.get('sshHosts', {})
-    machines = [machine for machine in discovery['machines'] if machine['id']=='local' or
-                (machine.get('source')=='ssh-config' and machine.get('alias') in ssh_hosts
-                 and machine['id']=='ssh:'+machine['alias'])]
+    ssh_hosts=discovery.get('sshHosts',{})
+    specs=[spec for spec in controller_specs() if spec['alias'] in ssh_hosts]
+    machines=[machine for machine in discovery['machines'] if machine['id']=='local' or
+              (machine.get('source')=='ssh-config' and machine.get('alias') in ssh_hosts and
+               machine['id']=='ssh:'+machine['alias'])]
     storage_name=next(machine['name'] for machine in machines if machine['id']=='local')
     caller,local_identity=resolve_context(client_context,os.environ.get('SSH_CONNECTION',''),
-                                          ssh_hosts,storage_name)
-    peer_connections = discovery.get('peerConnections', [])
-    windows_peers = [p for p in peer_connections if is_windows_peer(p) and
-                     set(p.get('aliases',[])).intersection(ssh_hosts)]
-    windows = next((machine for machine in machines if machine['id']=='ssh:'+WINDOWS_ALIAS), None)
-    # Only the registered SSH pair is eligible. A cache or cloud device record
-    # must never grant authority to query or stop another machine.
-    if local_identity is not None:
-        identity=local_identity
-        event('identity.local',source='windows-local',status=identity.get('detection','unavailable'))
-        if identity.get('available'):
-            atomic_json(ROOT/'windows-identity-cache.json',identity)
-    else:
-        identity = windows_identity(force=force) if windows and windows_peers else dict(
-            available=False, error='Windows 的 SSH 会话代理尚未连接；不能据此判定电脑离线。')
-    if windows:
-        if identity.get('hostName') and (identity.get('available') or local_identity is not None):
-            windows['name']=identity['hostName']
-        if caller['platform']=='windows' and caller['verified']:
-            caller['machineId']=windows['id']
-        linked_aliases = {a for p in windows_peers for a in p.get('aliases', []) if a in PEER_ALIASES}
-        machines = [m for m in machines if m is windows or not (m.get('source')=='ssh-config' and m.get('alias') in linked_aliases)]
-        windows['sources'] = ['ssh-config'] + (['verified-ssh-peer'] if windows_peers else [])
+                                         ssh_hosts,storage_name,specs=specs)
+    peers=discovery.get('peerConnections',[])
+    identities={}
+    machine_by_id={machine['id']:machine for machine in machines}
+    spec_by_id={spec['id']:spec for spec in specs}
+    grouped_aliases={alias:spec['id'] for spec in specs for alias in spec['peer_aliases']}
+    machines=[machine for machine in machines if machine.get('alias') not in grouped_aliases or
+              machine['id']==grouped_aliases[machine['alias']]]
+    linked_by_id={spec['id']:[peer for peer in peers if peer_controller_ids(peer,specs)==[spec['id']]] for spec in specs}
+    pending=[spec for spec in specs if linked_by_id[spec['id']] and
+             not (local_identity is not None and caller.get('machineId')==spec['id'])]
+    if pending:
+        with ThreadPoolExecutor(max_workers=min(8,len(pending))) as pool:
+            queries={spec['id']:pool.submit(controller_identity,spec,ssh_hosts,force=force) for spec in pending}
+            identities.update({key:future.result() for key,future in queries.items()})
+    for spec in specs:
+        machine=machine_by_id[spec['id']]
+        linked=linked_by_id[spec['id']]
+        if local_identity is not None and caller.get('machineId')==spec['id']:
+            identity=local_identity
+        elif linked:
+            identity=identities[spec['id']]
+        else:
+            identity=dict(available=False,error='SSH 任务代理尚未连接；不能据此判定电脑离线。')
+        identities[spec['id']]=identity
+        if identity.get('hostName') and (identity.get('available') or caller.get('machineId')==spec['id']):
+            machine['name']=identity['hostName']
+        problem=controller_problem(identity)
+        if not identity.get('hostName') and not problem:
+            problem='SSH 返回的主机名称未确认。'
+        proven=bool(linked) and not problem
+        is_caller=caller.get('verified') and caller.get('machineId')==spec['id']
+        label='Windows' if spec['platform']=='windows' else 'Mac'
+        machine.update(selectable=bool(proven),reason='' if proven else problem,
+                       clientKind=spec['platform'],role='writer-controller',sourceLabel='SSH · '+label+' 控制端检测',
+                       status='online' if proven or is_caller else 'configured',
+                       statusLabel=('当前操作端 · ' if is_caller else label+' · ')+('可接管' if proven else '接管条件未满足'),
+                       transport='ssh',isCaller=bool(is_caller),sources=['ssh-config']+(['verified-ssh-peer'] if linked else []))
     for machine in machines:
-        if machine['id'] == 'local':
-            machine.update(selectable=True, clientKind='mac',role='storage-host',sourceLabel='Mac 会话数据主机',
-                           statusLabel='本机 Mac · 会话数据主机' if caller['platform']=='mac' else '在线 · Mac 会话数据主机')
-        elif machine is windows:
-            problem=controller_problem(identity)
-            if not identity.get('hostName') and not problem:
-                problem='SSH 返回的主机名称未确认。'
-            proven = bool(windows_peers) and not problem
-            is_caller=caller['platform']=='windows' and caller['verified']
-            machine.update(selectable=bool(proven), reason='' if proven else (problem or 'Windows 未连接 Mac 会话服务；不是 Windows 电脑离线。'),
-                           clientKind='windows',role='writer-controller',sourceLabel='SSH · Windows 本机检测' if local_identity is not None else 'SSH · Windows 连接检测',
-                           status='online' if proven or is_caller else 'configured',
-                           statusLabel=('本机 Windows · 可接管' if is_caller else 'Windows · 可接管') if proven else
-                                       ('本机 Windows 在线 · 接管条件未满足' if is_caller else 'SSH 已配置 · Windows 接管状态待确认'),
-                           transport='ssh',isCaller=is_caller)
+        if machine['id']=='local':
+            machine.update(selectable=True,clientKind='mac',role='storage-host',sourceLabel='任务数据主机',
+                           statusLabel='本机 · 数据主机' if caller.get('machineId')=='local' else '在线 · 数据主机')
         if not machine.get('selectable'):
             diagnostics.append(diagnostic('machine_'+hashlib.sha256(machine['id'].encode()).hexdigest()[:8],
-                                          machine['name']+' · '+machine['statusLabel'], machine.get('reason',''), '', 'info'))
-    if windows_peers and not windows:
-        diagnostics.append(diagnostic('peer_ssh_unregistered', 'Windows SSH 配置尚未完整',
-                                      '检测到 SSH 连接，但指定的 Windows 主机别名不在用户 SSH 主机列表中。', '在 SSH 配置中登记 windows_ssh_alias 对应的具名 Host 块。'))
-    if windows_peers and not identity.get('available'):
-        diagnostics.append(diagnostic('windows_probe_failed','Windows 状态检查失败',identity.get('error','连接检查未成功'),
-                                      '刷新 SSH 主机；检查密钥、主机指纹与 VPN/局域网连接。'))
-    owners = {}
-    affected = {}
-    for thread_id, entries in locks.items():
+                                          machine['name']+' · '+machine['statusLabel'],machine.get('reason',''),'','info'))
+    for peer in peers:
+        if len(peer_controller_ids(peer,specs))!=1:
+            diagnostics.append(diagnostic('peer_unconfirmed','存在未唯一对应的 SSH 控制端',
+                                          '该连接不能唯一对应到已登记的控制端；不会自动关闭。','检查 ssh_controllers 和 SSH 别名/地址。'))
+    owners={}
+    affected={}
+    for thread_id,entries in locks.items():
         for item in entries:
-            affected.setdefault(item['pid'], []).append(thread_id)
-        if len(entries) != 1:
-            owners[thread_id] = dict(pid=0, ownerState='ambiguous', writerHostName='多个进程占用', ownerMachineId=None, processKind='unknown')
+            affected.setdefault(item['pid'],[]).append(thread_id)
+        if len(entries)!=1:
+            owners[thread_id]=dict(pid=0,ownerState='ambiguous',writerHostName='多个进程占用',
+                                  ownerMachineId=None,ownerMachineIds=[],processKind='unknown')
             continue
-        pid = entries[0]['pid']
-        kind = process_kind(processes.get(pid, {}), processes)
-        peers = [p for p in peer_connections if p['serverPid'] == pid]
-        endpoints = {p['peerIp'] for p in peers}
-        if kind == 'mac-desktop':
-            name, machine_id, state = machines[0]['name'], 'local', 'observed'
-        elif kind == 'ssh-server' and len(endpoints) == 1 and windows and any(is_windows_peer(p) for p in peers):
-            name, machine_id, state = windows['name'], windows['id'], 'observed'
-        elif kind == 'ssh-server':
-            name, machine_id, state = 'SSH 共享服务（客户端未确认）', None, 'ambiguous'
+        pid=entries[0]['pid']
+        kind=process_kind(processes.get(pid,{}),processes)
+        links=[peer for peer in peers if peer['serverPid']==pid]
+        mapping=[peer_controller_ids(peer,specs) for peer in links]
+        ids=sorted({key for match in mapping for key in match}) if mapping and all(len(match)==1 for match in mapping) else []
+        if kind=='mac-desktop':
+            name,machine_id,state,ids=storage_name,'local','observed',['local']
+        elif kind=='ssh-server' and ids:
+            names=[machine_by_id[key]['name'] for key in ids]
+            name=names[0] if len(ids)==1 else '共享 SSH：'+'、'.join(names)
+            machine_id=ids[0] if len(ids)==1 else None
+            state='observed' if len(ids)==1 else 'shared'
+        elif kind=='ssh-server':
+            name,machine_id,state='SSH 共享服务（控制端未确认）',None,'ambiguous'
         else:
-            name, machine_id, state = '未识别进程', None, 'unknown'
-        owners[thread_id] = dict(pid=pid, ownerState=state, writerHostName=name, ownerMachineId=machine_id, processKind=kind)
+            name,machine_id,state='未识别进程',None,'unknown'
+        owners[thread_id]=dict(pid=pid,ownerState=state,writerHostName=name,ownerMachineId=machine_id,
+                               ownerMachineIds=ids,processKind=kind)
     def record(thread_id):
         meta = threads.get(thread_id, {})
         name = meta.get('name') or meta.get('title') or thread_id
@@ -325,6 +402,7 @@ def observe(force=False, client_context=None):
         owner = owners.get(thread_id, dict(pid=0, ownerState='unowned', writerHostName='未占用', ownerMachineId=None, processKind='none'))
         state = live.get(thread_id, 'unknown' if owner['pid'] else 'notLoaded')
         summary = '已根据实际文件句柄确认占用进程。' if owner['ownerState']=='observed' else (
+            '多个已登记 SSH 控制端共用此服务；交接将列出需断开的控制端。' if owner['ownerState']=='shared' else
             '没有进程打开该会话写锁。' if not owner['pid'] and owner['ownerState']=='unowned' else '占用来源不明确，请先排错。')
         if owner['pid'] and owner['pid'] != server_pid:
             summary += ' 桌面服务的运行状态需在对应客户端查看。'
@@ -345,7 +423,7 @@ def observe(force=False, client_context=None):
                                           '应用前检查影响列表。', 'info'))
         if process_kind(processes.get(pid,{}),processes)=='unknown':
             diagnostics.append(diagnostic('owner_unknown_'+str(pid),'发现未识别持锁进程',f'进程 {pid} 的身份不满足自动交接条件。','检查该进程后再应用。'))
-    diagnostics.append(diagnostic('scope','仅支持 SSH 双机交接','显示 Mac 保存的最近 60 条主任务及已占用主任务；操作端不等于当前占用者。机器发现与跨机控制只使用用户配置的 SSH。',
+    diagnostics.append(diagnostic('scope','SSH 多机交接','显示数据主机保存的最近 60 条主任务及已占用主任务；操作端不等于当前占用者。控制端按用户 SSH 配置逐台核验，不要求远端运行本工具界面。',
                                   '跨网请自行配置 Tailscale 或 VPN；不支持 OpenAI 同账号设备中转模式。','info'))
     last = read_json(ROOT/'last-handoff.json')
     if last.get('ok') is False:
@@ -356,37 +434,43 @@ def observe(force=False, client_context=None):
         diagnostics.append(diagnostic('continue_pending','强制接管恢复记录待核对',
                                       '写入权与代理继续分别记录；恢复编号：'+str(recovery.get('operationId','')),
                                       '在日志中的 force-handoff.json 查看名单和发送状态；不要盲目重复继续。'))
-    snapshot = dict(schemaVersion=4, backendVersion='3.4.0', generatedAt=dt.datetime.now(dt.timezone.utc).isoformat(), records=rows,
+    snapshot = dict(schemaVersion=5, backendVersion='4.0.0', generatedAt=dt.datetime.now(dt.timezone.utc).isoformat(), records=rows,
                     caller=caller,storageHost=dict(name=storage_name,platform='mac',machineId='local'),
                     machines=machines, diagnostics=diagnostics, stale=False, discoveryMode='ssh-only',
                     discoveryScope=discovery.get('discoveryScope',''), refreshSeconds=10,logInfo=log_info())
     event('snapshot.complete',operation='snapshot',durationMs=(time.monotonic()-started)*1000,
           diagnostics=[d['code'] for d in diagnostics],ownerPid=server_pid)
     return snapshot, dict(processes=processes, locks=locks, threads=threads, owners=owners, affected=affected,
-                          record=record, serverPid=server_pid, identity=identity, peers=peer_connections)
+                          record=record,serverPid=server_pid,identities=identities,controllerSpecs=specs,
+                          identity=next(iter(identities.values()),{}),peers=peers,sshHosts=ssh_hosts)
 
 
 def revision_for(thread_id, machine, context, force_scope=None):
-    owner = context['owners'].get(thread_id, {})
-    pid = owner.get('pid',0)
-    p = context['processes'].get(pid,{})
-    impacted = sorted(context['affected'].get(pid, []))
-    identity = context.get('identity',{}) if machine.get('clientKind')=='mac' and owner.get('processKind')=='ssh-server' else {}
-    stamp = dict(threadId=thread_id, machineId=machine['id'], owner=owner, process=p,
-                 locks=context['locks'].get(thread_id,[]), impacted=impacted,
-                 states={i:context['record'](i)['status'] for i in impacted},
-                 destinationProcess=context['processes'].get(context['serverPid'],{}) if machine.get('clientKind')=='windows' else {},
-                 peers=[{k:v for k,v in peer.items() if k!='verifiedAt'} for peer in context.get('peers',[])],
-                 windowsControllers=identity.get('controllers',[]), selectable=machine.get('selectable',False))
+    owner=context['owners'].get(thread_id,{})
+    pid=owner.get('pid',0)
+    impacted=sorted(set(context['affected'].get(pid,[])) | (
+        set(context['affected'].get(context['serverPid'],[])) if machine['id']!='local' else set()))
+    stamp=dict(threadId=thread_id,machineId=machine['id'],owner=owner,
+               process=context['processes'].get(pid,{}),locks=context['locks'].get(thread_id,[]),
+               impacted=impacted,states={key:context['record'](key)['status'] for key in impacted},
+               destinationProcess=context['processes'].get(context['serverPid'],{}) if machine['id']!='local' else {},
+               affectedLocks={key:context['locks'].get(key,[]) for key in impacted},
+               peers=[{k:v for k,v in peer.items() if k!='verifiedAt'} for peer in context.get('peers',[])],
+               specs=context.get('controllerSpecs',[]),
+               identities={key:{k:v for k,v in value.items() if k!='checkedAt'} for key,value in context.get('identities',{}).items()},
+               selectable=machine.get('selectable',False))
     if force_scope is not None:
-        stamp['forceContinue'] = writer_force.stamp(force_scope,context)
+        stamp['forceContinue']=writer_force.stamp(force_scope,context)
     return hashlib.sha256(json.dumps(stamp,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
 
 
 def make_plan(thread_id, machine_id, force=False, force_continue=False, client_context=None):
     snapshot, context = observe(force,client_context=client_context)
     machines = snapshot['machines']
-    machine = next((m for m in machines if m['id']==machine_id or m['name']==machine_id), None)
+    matches=[m for m in machines if m['id']==machine_id]
+    if not matches:
+        matches=[m for m in machines if m['name']==machine_id]
+    machine=matches[0] if len(matches)==1 else None
     if not machine:
         raise WriterError('目标主机不在当前发现列表中，请重新发现。')
     row = next((r for r in snapshot['records'] if r['id']==thread_id), None)
@@ -396,9 +480,21 @@ def make_plan(thread_id, machine_id, force=False, force_continue=False, client_c
     impacts = [context['record'](k) for k in context['affected'].get(row['pid'],[])]
     reason = ''
     force_scope = None
+    controller_effects=[]
+    try:
+        remote_pids={row['pid']} if row['processKind']=='ssh-server' else set()
+        if machine['id']!='local' and context['serverPid']:
+            remote_pids.add(context['serverPid'])
+        controller_effects=[effect for pid in sorted(remote_pids) for effect in controller_impacts(pid,machine,context)]
+        if machine['id']!='local' and controller_effects:
+            impact_ids={item['id'] for item in impacts} | set(context['affected'].get(context['serverPid'],[]))
+            impacts=[context['record'](key) for key in sorted(impact_ids)]
+    except WriterError as error:
+        reason=str(error)
     if force_continue:
         try:
             force_scope = writer_force.prepare(sys.modules[__name__],thread_id,machine,context)
+            controller_effects=force_scope['controllerImpacts']
             impacts = [context['record'](k) for k in force_scope['affected']]
             runtime_by_id = {entry['id']:entry for entry in force_scope['runtime']}
             for impact in impacts:
@@ -417,8 +513,6 @@ def make_plan(thread_id, machine_id, force=False, force_continue=False, client_c
         reason='当前占用者无法确定，无法自动交接。'
     elif not machine.get('selectable'):
         reason=machine.get('reason') or '该主机当前不可用。'
-    elif row['processKind']=='ssh-server' and machine['clientKind']=='mac' and not same and not force_continue:
-        reason=controller_problem(context['identity'])
     if CONFIG.get('enable_handoff') is not True:
         reason='只读模式：请完成配置并显式开启 enable_handoff 后再应用。'
     if same:
@@ -430,6 +524,10 @@ def make_plan(thread_id, machine_id, force=False, force_continue=False, client_c
             message+='\n\n切换需要关闭原客户端写入服务，会影响以下会话：\n'+'\n'.join('• '+r['name']+'（'+r['statusLabel']+'）' for r in impacts)
             message+='\n\n原桌面客户端也会退出；它连接的其他远程主机将断开。上表仅枚举本机保存的会话。'
         message+='\n\n应用后将检查实际写锁归属。'
+        if controller_effects:
+            message+='\n\n将关闭以下 SSH 控制端的 Codex 窗口：\n'+'\n'.join('• '+item['name']+'（'+item['machineId']+'）' for item in controller_effects)
+        if machine['id']!='local' and row['pid']==context['serverPid']:
+            message+='\n保留目标控制端和共享后台，仅断开其他已确认控制端。'
         if force_continue:
             active = [entry for entry in (force_scope or {}).get('runtime',[]) if entry['status']=='active']
             message+='\n\n已选择强制接管：记录 '+str(len(active))+' 个运行中代理。正常关闭后仍持锁时，才强制停止上述已核验服务。'
@@ -440,7 +538,7 @@ def make_plan(thread_id, machine_id, force=False, force_continue=False, client_c
     plan=dict(threadId=thread_id,currentPid=row['pid'],machineId=machine['id'],message=message,
               canApply=not reason,reason=reason,revision=revision_for(thread_id,machine,context,force_scope),
               changed=not same,impacted=impacts,currentOwner=row['writerHostName'],desiredOwner=machine['name'],
-              forceContinue=force_continue,forceScope=force_scope)
+              forceContinue=force_continue,forceScope=force_scope,controllerImpacts=controller_effects)
     event('plan.complete',operation='plan',sessionId=thread_id,machineId=machine['id'],canApply=not reason,
           ownerPid=row['pid'],reason=reason,controllerCount=len(context['identity'].get('controllers',[])),
           errorCode=context['identity'].get('errorCode') if reason else None)
@@ -472,18 +570,18 @@ def wait_released(pid, start, thread_ids, timeout=12):
 
 
 def acquire_writer(thread_id, machine, context):
-    # Reuse the existing acquisition and postflight rules for each affected root.
+    local=machine['id']=='local'
     holders=lock_inventory().get(thread_id,[])
-    wanted='ssh-server' if machine['clientKind']=='windows' else 'mac-desktop'
+    wanted='mac-desktop' if local else 'ssh-server'
     already=False
     if holders:
         processes=process_table()
         already=(len(holders)==1 and process_kind(processes.get(holders[0]['pid'],{}),processes)==wanted
-                 and (wanted=='mac-desktop' or holders[0]['pid']==context['serverPid']))
+                 and (local or holders[0]['pid']==context['serverPid']))
         if not already:
             raise WriterError('目标任务仍由其他写入者占用，未启动继续。',code='DESTINATION_NOT_OWNED')
     if not already:
-        if machine['clientKind']=='windows':
+        if not local:
             if socket_server(process_table())!=context['serverPid']:
                 raise WriterError('目标会话服务已变化，请刷新。')
             rpc=RPC(CONTROL,timeout=15)
@@ -491,25 +589,29 @@ def acquire_writer(thread_id, machine, context):
                 rpc.call('thread/resume',{'threadId':thread_id,'excludeTurns':True})
             finally:
                 rpc.close()
-        elif machine['clientKind']=='mac':
+        else:
             result=command(['/usr/bin/open','-a',str(CODEX_APP),'codex://threads/'+thread_id])
             if result.returncode:
-                raise WriterError('写锁已释放，但 Mac 未打开该任务。')
-        else:
-            raise WriterError('该主机没有支持的交接接口。')
+                raise WriterError('写锁已释放，但本机未打开该任务。')
     deadline=time.monotonic()+20
     while time.monotonic()<deadline:
         holders=lock_inventory().get(thread_id,[])
         if len(holders)==1:
             processes=process_table()
             if process_kind(processes.get(holders[0]['pid'],{}),processes)==wanted:
-                if wanted=='ssh-server':
+                if not local:
                     if holders[0]['pid']!=context['serverPid']:
                         raise WriterError('写锁被另一个后台服务获取，请刷新确认。')
                     from discovery_adapter import peer_connections
-                    peers=[p for p in peer_connections() if p['serverPid']==holders[0]['pid']]
-                    if len({p['peerIp'] for p in peers})!=1 or not any(is_windows_peer(p) for p in peers):
-                        raise WriterError('目标服务已取得锁，但控制端身份变化。')
+                    peers=[peer for peer in peer_connections() if peer['serverPid']==holders[0]['pid']]
+                    if not peers or any(peer_controller_ids(peer,context['controllerSpecs'])!=[machine['id']] for peer in peers):
+                        raise WriterError('后台已持锁，但尚未确认目标为唯一 SSH 控制端。',code='DESTINATION_SHARED')
+                    spec=next(spec for spec in context['controllerSpecs'] if spec['id']==machine['id'])
+                    fresh=controller_identity(spec,context['sshHosts'],force=True)
+                    approved=context['identities'][machine['id']]
+                    if (controller_problem(fresh) or fresh.get('hostName')!=approved.get('hostName') or
+                            fresh.get('controllers')!=approved.get('controllers')):
+                        raise WriterError('目标控制端进程身份变化，请刷新。',code='DESTINATION_CHANGED')
                 return dict(ok=True,changed=not already,threadId=thread_id,machineId=machine['id'],
                             pid=holders[0]['pid'],message='已交给 '+machine['name']+'：'+thread_id)
         time.sleep(.3)
@@ -525,84 +627,52 @@ def claim(thread_id, machine_id, expected_revision, force_continue=False, client
             fcntl.flock(guard,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:
             raise WriterError('另一项交接正在进行，请等待它完成后刷新。')
-        p,snapshot,context,machine=make_plan(thread_id,machine_id,force=True,force_continue=force_continue,client_context=client_context)
-        if not p['canApply']:
-            raise WriterError(p['reason'])
-        if not expected_revision or p['revision']!=expected_revision:
-            raise WriterError('占用进程、影响范围或目标连接已变化，请刷新并重新应用。')
-        if not p['changed']:
-            return dict(ok=True,changed=False,message=p['message'])
+        plan,snapshot,context,machine=make_plan(thread_id,machine_id,force=True,force_continue=force_continue,client_context=client_context)
+        if not plan['canApply']:
+            raise WriterError(plan['reason'])
+        if not expected_revision or plan['revision']!=expected_revision:
+            raise WriterError('占用进程、控制端、影响范围或目标连接已变化，请刷新并重新应用。')
+        if not plan['changed']:
+            return dict(ok=True,changed=False,message=plan['message'])
         if force_continue:
-            return writer_force.apply(sys.modules[__name__],p,context,machine)
+            return writer_force.apply(sys.modules[__name__],plan,context,machine)
         owner=context['owners'].get(thread_id,{})
         pid=owner.get('pid',0)
         process=context['processes'].get(pid,{})
-        # All reads/probes above completed before any write. No timer invokes this function.
         if pid:
             current=process_table().get(pid,{})
             new_locks=lock_inventory()
-            new_affected=sorted(k for k,entries in new_locks.items() if any(e['pid']==pid for e in entries))
-            if (current!=process or new_locks.get(thread_id)!=context['locks'].get(thread_id)
-                    or new_affected!=sorted(context['affected'].get(pid,[]))):
+            affected=sorted(key for key,entries in new_locks.items() if any(item['pid']==pid for item in entries))
+            if current!=process or new_locks.get(thread_id)!=context['locks'].get(thread_id) or affected!=sorted(context['affected'].get(pid,[])):
                 raise WriterError('确认后占用者已变化，请刷新。')
             if owner['processKind']=='mac-desktop':
                 app=context['processes'].get(process['ppid'],{})
                 if process_table().get(app.get('pid'))!=app:
                     raise WriterError('原桌面进程已变化。')
-                event('claim.close_source',operation='claim',stage='mac_desktop',sessionId=thread_id,ownerPid=app['pid'])
                 os.kill(app['pid'],signal.SIGTERM)
                 wait_released(pid,process['start'],writer_force.family_of(thread_id,context['threads']))
             elif owner['processKind']=='ssh-server':
-                controllers=context['identity']['controllers']
-                event('claim.close_source',operation='claim',stage='windows_desktop',sessionId=thread_id,ownerPid=controllers[0]['pid'])
-                windows_bridge('close-desktop',expectedPid=controllers[0]['pid'],expectedStart=controllers[0]['start'])
-                current=process_table().get(pid)
-                if current:
-                    if current!=process:
-                        raise WriterError('原服务身份已变化，停止交接。')
-                    event('claim.release_writer',operation='claim',sessionId=thread_id,ownerPid=pid)
-                    os.kill(pid,signal.SIGTERM)
-                    wait_released(pid,process['start'],writer_force.family_of(thread_id,context['threads']))
+                close_remote_controllers(pid,machine,context)
+                preserve=machine['id']!='local' and pid==context['serverPid']
+                if not preserve:
+                    if checked_peers(pid,context):
+                        raise WriterError('仍有 SSH 控制端连接，未停止共享后台。',code='CONTROLLER_STILL_CONNECTED')
+                    current=process_table().get(pid)
+                    if current:
+                        if current!=process:
+                            raise WriterError('原服务身份已变化，请刷新。')
+                        os.kill(pid,signal.SIGTERM)
+                        wait_released(pid,process['start'],writer_force.family_of(thread_id,context['threads']))
             else:
                 raise WriterError('占用进程类型不支持交接。')
-        if machine['clientKind']=='windows':
-            event('claim.acquire',operation='claim',stage='windows',sessionId=thread_id)
-            if socket_server(process_table())!=context['serverPid']:
-                raise WriterError('目标会话服务已变化，已停止交接；请刷新。')
-            rpc=RPC(CONTROL,timeout=15)
-            try:
-                rpc.call('thread/resume',{'threadId':thread_id,'excludeTurns':True})
-            finally:
-                rpc.close()
-        elif machine['clientKind']=='mac':
-            event('claim.acquire',operation='claim',stage='mac',sessionId=thread_id)
-            result=command(['/usr/bin/open','-a',str(CODEX_APP),'codex://threads/'+thread_id])
-            if result.returncode:
-                raise WriterError('写锁已释放，但目标客户端未打开；请在目标主机重新打开会话。')
-        else:
-            raise WriterError('该主机没有支持的交接接口。')
-        wanted='ssh-server' if machine['clientKind']=='windows' else 'mac-desktop'
-        deadline=time.monotonic()+20
-        while time.monotonic()<deadline:
-            holders=lock_inventory().get(thread_id,[])
-            if len(holders)==1:
-                processes=process_table()
-                if process_kind(processes.get(holders[0]['pid'],{}),processes)==wanted:
-                    if wanted=='ssh-server':
-                        if holders[0]['pid']!=context['serverPid']:
-                            raise WriterError('写锁被另一个后台服务获取，请刷新确认。')
-                        # Verify the controller as well as the host-side process.
-                        from discovery_adapter import peer_connections
-                        peers=[p for p in peer_connections() if p['serverPid']==holders[0]['pid']]
-                        if len({p['peerIp'] for p in peers})!=1 or not any(is_windows_peer(p) for p in peers):
-                            raise WriterError('目标服务已取得锁，但控制端身份变化；请刷新确认。')
-                    result=dict(ok=True,changed=True,threadId=thread_id,machineId=machine['id'],
-                                pid=holders[0]['pid'],message='已交给 '+machine['name']+'：'+p['threadId'])
-                    atomic_json(ROOT/'last-handoff.json',dict(at=dt.datetime.now(dt.timezone.utc).isoformat(),**result))
-                    event('claim.verified',operation='claim',status='success',sessionId=thread_id,ownerPid=holders[0]['pid'],machineId=machine['id'])
-                    return result
-            time.sleep(.3)
-        raise WriterError('原占用者已释放，但未确认目标取得写锁，请刷新查看当前占用者。')
+        if machine['id']!='local' and context['serverPid']!=pid:
+            close_remote_controllers(context['serverPid'],machine,context)
+        result=acquire_writer(thread_id,machine,context)
+        result['changed']=True
+        result['controllerImpacts']=plan['controllerImpacts']
+        atomic_json(ROOT/'last-handoff.json',dict(at=dt.datetime.now(dt.timezone.utc).isoformat(),**result))
+        event('claim.verified',operation='claim',status='success',sessionId=thread_id,ownerPid=result['pid'],machineId=machine['id'])
+        return result
 
 
 def valid_uuid(value):

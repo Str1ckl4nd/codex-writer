@@ -155,7 +155,7 @@ private func loadSnapshot(rediscover: Bool = false, fixturePath: String? = nil) 
         data = try runBackend(arguments)
     }
     let snapshot = try JSONDecoder().decode(WriterSnapshot.self, from: data)
-    guard snapshot.schemaVersion == 4 else {
+    guard snapshot.schemaVersion == 5 else {
         throw UIError.backend("界面和后台版本不一致，请更新后重试。")
     }
     return snapshot

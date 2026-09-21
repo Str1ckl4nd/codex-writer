@@ -13,7 +13,7 @@ $WriterConfig = Get-Content -LiteralPath $WriterConfigPath -Raw -Encoding UTF8 |
 $MacHost = [string]$WriterConfig.mac_ssh_alias
 $Backend = [string]$WriterConfig.mac_backend_path
 $MacPython = if ($WriterConfig.mac_python) { [string]$WriterConfig.mac_python } else { '/usr/bin/python3' }
-if ($MacHost -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' -or -not $Backend.StartsWith('/') -or $Backend.Contains('YOUR_MAC_USER') -or -not $MacPython.StartsWith('/')) { throw '请填写有效的 Mac SSH 别名、绝对后台路径与 Python 路径。' }
+if ($MacHost -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' -or (-not [string]::IsNullOrWhiteSpace($Backend) -and (-not $Backend.StartsWith('/') -or $Backend.Contains('YOUR_MAC_USER'))) -or -not $MacPython.StartsWith('/')) { throw '请填写有效的 SSH 别名和 Python 路径；可选后台路径必须是绝对路径。' }
 $NL = [Environment]::NewLine
 $script:CallerHostName = [System.Net.Dns]::GetHostName()
 $script:LogDirectory = Join-Path $env:LOCALAPPDATA 'SessionWriter\logs'
@@ -39,7 +39,7 @@ function Write-WriterLog {
         $entry = [ordered]@{
             timestamp = [DateTime]::UtcNow.ToString('o')
             source = 'windows-ui'
-            toolVersion = '3.4'
+            toolVersion = '4.0'
             event = $Event
             kind = $(if ($Kind -in @('snapshot', 'plan', 'claim', 'logs')) { $Kind } else { 'other' })
             requestId = $RequestId
@@ -108,6 +108,21 @@ function Get-LocalWriterContext {
     return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($context | ConvertTo-Json -Depth 8 -Compress)))
 }
 
+function Get-RemoteBackendPackage {
+    param([string[]]$Arguments, [string]$ApplicationRoot = $PSScriptRoot)
+    $files = @{}
+    foreach ($name in @('session_writer.py','writer_service.py','writer_force.py','writer_desktop.py','writer_history.py','writer_rpc.py','writer_log.py','caller_context.py','discovery_adapter.py','runtime_config.py','ssh_bridge.py','mac_controller.py','windows_controller.ps1')) {
+        $files[$name] = [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $ApplicationRoot $name)))
+    }
+    $config = @{}
+    foreach ($name in @('codex_home','codex_app','codex_binary','ssh_controllers','enable_handoff','windows_ssh_alias','windows_peer_aliases','mac_ssh_alias','excluded_thread_ids')) {
+        if ($null -ne $WriterConfig.PSObject.Properties[$name]) { $config[$name] = $WriterConfig.$name }
+    }
+    $json = @{ files=$files; config=$config; argv=@($Arguments) } | ConvertTo-Json -Depth 12 -Compress
+    if ([Text.Encoding]::UTF8.GetByteCount($json) -gt 2097152) { throw 'Backend package exceeds size limit' }
+    return $json
+}
+
 # Run local inspection and SSH in a child so WMI/network waits never block the GUI.
 if (-not [string]::IsNullOrWhiteSpace($BackendRequestBase64)) {
     $requestStage = 'decode_arguments'
@@ -119,9 +134,17 @@ if (-not [string]::IsNullOrWhiteSpace($BackendRequestBase64)) {
         $requestStage = 'local_identity'
         $contextArgument = Get-LocalWriterContext
         $requestStage = 'ssh_request'
-        $remoteParts = @($MacPython, $Backend) + $requestArguments + @('--client-context', $contextArgument)
-        $remoteCommand = ($remoteParts | ForEach-Object { ConvertTo-RemoteArgument ([string]$_) }) -join ' '
-        & ssh.exe -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 $MacHost $remoteCommand
+        $backendArguments = @($requestArguments) + @('--client-context', $contextArgument)
+        if ([string]::IsNullOrWhiteSpace($Backend)) {
+            $bootstrap = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'remote_bootstrap.py'))
+            $remoteParts = @($MacPython, '-c', $bootstrap)
+            $remoteCommand = ($remoteParts | ForEach-Object { ConvertTo-RemoteArgument ([string]$_) }) -join ' '
+            Get-RemoteBackendPackage -Arguments $backendArguments | & ssh.exe -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 $MacHost $remoteCommand
+        } else {
+            $remoteParts = @($MacPython, $Backend) + $backendArguments
+            $remoteCommand = ($remoteParts | ForEach-Object { ConvertTo-RemoteArgument ([string]$_) }) -join ' '
+            & ssh.exe -T -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=2 $MacHost $remoteCommand
+        }
         exit $LASTEXITCODE
     } catch {
         @{ ok = $false; errorCode = 'WINDOWS_REQUEST_FAILED'; stage = $requestStage;
@@ -425,7 +448,7 @@ function Update-Diagnostics {
 }
 function Show-Snapshot {
     param($NewSnapshot)
-    if ([int]$NewSnapshot.schemaVersion -ne 4 -or $null -eq $NewSnapshot.PSObject.Properties['records'] -or $null -eq $NewSnapshot.PSObject.Properties['machines']) { throw '服务返回的数据版本不匹配，需要更新两端工具。' }
+    if ([int]$NewSnapshot.schemaVersion -ne 5 -or $null -eq $NewSnapshot.PSObject.Properties['records'] -or $null -eq $NewSnapshot.PSObject.Properties['machines']) { throw '服务返回的数据版本不匹配，请更新当前工具。' }
     $selected = Get-SelectedRecord
     $selectedId = if ($null -ne $selected) { [string]$selected.id } else { '' }
     $sortColumnIndex = -1
