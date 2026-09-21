@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+if [ "$#" -eq 0 ]; then
+  exec /usr/bin/open -gj "$HOME/Applications/Session Writer.app"
+fi
+exec "${SESSION_WRITER_PYTHON:-/usr/bin/python3}" "$HOME/.local/share/session-writer/session_writer.py" "$@"

@@ -1,0 +1,11 @@
+{
+  "codex_home": "~/.codex",
+  "codex_app": "/Applications/ChatGPT.app",
+  "windows_ssh_alias": "windows-pc",
+  "windows_peer_aliases": ["windows-pc"],
+  "mac_ssh_alias": "mac",
+  "mac_backend_path": "/Users/YOUR_MAC_USER/.local/share/session-writer/session_writer.py",
+  "mac_python": "/usr/bin/python3",
+  "enable_handoff": false,
+  "excluded_thread_ids": []
+}

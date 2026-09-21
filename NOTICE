@@ -1,0 +1,26 @@
+Codex Writer
+Copyright (c) 2026 Str1ckl4nd and Codex Writer contributors
+SPDX-License-Identifier: MIT
+
+本仓库中的原创项目代码和随附项目文档按 LICENSE 中的 MIT License 提供。
+复制或分发本软件的全部或实质性部分时，应保留版权声明和许可证声明。
+各贡献者对其享有权利的贡献保留相应版权；本声明不主张对不属于贡献者的材料取得权利。
+
+本项目有 AI 辅助编写和修改。AI 辅助不构成无侵权保证，也不能代替源代码审阅、
+许可证核对或对第三方素材的署名。不得把本项目声明解释为对任何生成片段权利状况的担保。
+
+第三方软件边界
+
+- Codex/ChatGPT：用户自行安装。本项目不随源码分发其应用包、提取的桌面源码、品牌图标或登录材料。
+- Python、OpenSSH、jq、PowerShell/.NET、macOS AppKit、Xcode 工具链：由用户或构建环境提供，
+  各自适用其原有许可和服务条款，不因本仓库使用 MIT 而被重新授权。
+- 本仓库中的 Windows 控制脚本、界面和 SSH 适配器是本项目的应用代码，不包含个人 SSH broker。
+- docs/ecosystem.md 中列出的其他项目仅为相关工作，不表示本项目包含其源码或获得其背书。
+
+品牌声明
+
+OpenAI 和 Codex、Microsoft 和 Windows、Apple 和 macOS、Tailscale 等名称及商标归各自权利人。
+本项目名称只标示兼容用途，不表示官方来源、合作、认证或背书。第三方服务的访问权不由 MIT 授予。
+
+如果后续引入第三方代码、图标、字体、库或再分发运行时，应在发布前增加对应的版权和许可声明。
+本文件不能替代这些第三方材料自身的许可。
